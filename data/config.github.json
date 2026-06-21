@@ -70,7 +70,7 @@
       "users": [
         {
           "username": "iamthatis",
-          "enabled": true,
+          "enabled": false,
           "sort": "new",
           "fetch_limit": 10
         }
@@ -78,9 +78,10 @@
       "fetch_comments": 5
     },
     "twitter": {
-      "enabled": false,
-      "users": ["karpathy", "ylecun"],
-      "fetch_limit": 10,
+      "enabled": true,
+      "mode": "apify",
+      "users": ["karpathy", "ylecun", "OpenAI", "AnthropicAI"],
+      "fetch_limit": 100,
       "fetch_reply_text": false,
       "max_replies_per_tweet": 3,
       "max_tweets_to_expand": 10,
