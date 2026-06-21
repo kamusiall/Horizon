@@ -36,7 +36,6 @@ jobs:
           # Map secrets to environment variables expected by config.json.
           # ai.api_key_env in data/config.github.json is OPENROUTER_API_KEY.
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           LWN_KEY: ${{ secrets.LWN_KEY }}
         run: uv run horizon --hours 48
 

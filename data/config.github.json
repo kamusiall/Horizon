@@ -78,7 +78,7 @@
       "fetch_comments": 5
     },
     "twitter": {
-      "enabled": true,
+      "enabled": false,
       "mode": "apify",
       "users": ["karpathy", "ylecun", "OpenAI", "AnthropicAI"],
       "fetch_limit": 100,
