@@ -25,7 +25,9 @@ class HackerNewsScraper(BaseScraper):
 
     async def fetch(self, since: datetime) -> List[ContentItem]:
         self.reset_coverage()
+        self.coverage["instrumented"] = True
         self.coverage["selection_limits"] = {
+            "sampled": False,
             "top_stories": self.config.get("fetch_top_stories", 30),
             "comments_per_story": TOP_COMMENTS_LIMIT,
             "min_score": self.config.get("min_score", 100),
@@ -40,7 +42,9 @@ class HackerNewsScraper(BaseScraper):
             story_ids = response.json()
 
             fetch_count = self.config.get("fetch_top_stories", 30)
-            self.coverage["truncated"] = len(story_ids) > fetch_count
+            # Sampling top stories/comments is the configured selection, not truncation.
+            if len(story_ids) > fetch_count:
+                self.coverage["selection_limits"]["sampled"] = True
             story_ids = story_ids[:fetch_count]
 
             # Fetch story details concurrently
@@ -72,7 +76,7 @@ class HackerNewsScraper(BaseScraper):
                 # Queue comment fetching
                 comment_ids = story.get("kids", [])[:TOP_COMMENTS_LIMIT]
                 if len(story.get("kids", [])) > TOP_COMMENTS_LIMIT:
-                    self.coverage["truncated"] = True
+                    self.coverage["selection_limits"]["sampled"] = True
                 comment_tasks.append(self._fetch_comments(comment_ids))
 
             # Fetch all comments concurrently
@@ -110,13 +114,12 @@ class HackerNewsScraper(BaseScraper):
         if not comment_ids:
             return []
 
-        tasks = [self._fetch_story(cid) for cid in comment_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # _fetch_story records its own failures; anything unexpected propagates to the
+        # caller's gather, which records a "comments" failure for the story.
+        results = await asyncio.gather(*[self._fetch_story(cid) for cid in comment_ids])
 
         comments = []
-        for comment_id, r in zip(comment_ids, results):
-            if isinstance(r, Exception):
-                self.record_failure("comment", r, native_id=comment_id)
+        for r in results:
             if isinstance(r, dict) and r.get("text") and not r.get("deleted") and not r.get("dead"):
                 comments.append(r)
         return comments

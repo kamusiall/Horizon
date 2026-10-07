@@ -20,14 +20,18 @@ logger = logging.getLogger(__name__)
 class RSSScraper(BaseScraper):
     """Scraper for RSS/Atom feeds."""
 
-    def __init__(self, sources: List[RSSSourceConfig], http_client: httpx.AsyncClient):
+    def __init__(self, sources: List[RSSSourceConfig], http_client: httpx.AsyncClient, keep_undated: bool = False):
         """Initialize RSS scraper.
 
         Args:
             sources: List of RSS feed configurations
             http_client: Shared async HTTP client
+            keep_undated: Research mode. Keep entries without a publication date and window
+                only on publication. The default keeps Horizon's windowing (fall back to
+                ``updated``; drop undated), because the digest has no cross-run dedup.
         """
         super().__init__({"sources": sources}, http_client)
+        self.keep_undated = keep_undated
 
     async def fetch(self, since: datetime) -> List[ContentItem]:
         """Fetch RSS feed items.
@@ -40,7 +44,9 @@ class RSSScraper(BaseScraper):
         """
         items = []
         self.reset_coverage()
-        self.coverage["selection_limits"] = {"scope": "entries in the returned feed; unknown publication dates retained"}
+        self.coverage["instrumented"] = True
+        self.coverage["selection_limits"] = {"scope": "entries in the returned feed; unknown publication dates retained"} if self.keep_undated else {
+            "scope": "entries in the returned feed dated (published, else updated) within the window; undated entries dropped"}
         sources = self.config["sources"]
 
         for source in sources:
@@ -81,14 +87,19 @@ class RSSScraper(BaseScraper):
             # Parse feed
             feed = feedparser.parse(response.text)
             if feed.bozo:
-                self.record_failure("parse_feed", feed.bozo_exception)
+                self.record_failure("parse_feed", feed.bozo_exception, source=source.name)
 
             for entry in feed.entries:
                 # Parse published date
                 published_at = self._parse_date(entry)
                 updated_at = self._parse_date(entry, fields=("updated",))
-                if published_at and published_at < since:
-                    continue
+                if self.keep_undated:
+                    if published_at and published_at < since:
+                        continue
+                else:
+                    window_at = published_at or updated_at
+                    if not window_at or window_at < since:
+                        continue
 
                 # Generate unique ID from feed URL and entry ID
                 feed_id = str(source.url).split("//")[1].replace("/", "_")
@@ -121,11 +132,11 @@ class RSSScraper(BaseScraper):
                 items.append(item)
 
         except httpx.HTTPError as e:
-            self.record_failure("fetch_feed", e)
-            logger.warning("RSS fetch failed (%s)", type(e).__name__)
+            self.record_failure("fetch_feed", e, source=source.name)
+            logger.warning("RSS fetch failed for %s (%s)", source.name, type(e).__name__)
         except Exception as e:
-            self.record_failure("parse_feed", e)
-            logger.warning("RSS parse failed (%s)", type(e).__name__)
+            self.record_failure("parse_feed", e, source=source.name)
+            logger.warning("RSS parse failed for %s (%s)", source.name, type(e).__name__)
 
         return items
 
@@ -147,6 +158,9 @@ class RSSScraper(BaseScraper):
                     date_str = entry[field]
                     try:
                         parsed = parsedate_to_datetime(date_str)
+                        if parsed.tzinfo is None:
+                            # RFC 5322 "-0000": UTC with unknown local offset.
+                            parsed = parsed.replace(tzinfo=timezone.utc)
                     except (TypeError, ValueError):
                         parsed = isoparse(date_str)
                     if parsed.tzinfo is not None:
