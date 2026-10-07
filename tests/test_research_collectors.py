@@ -201,5 +201,21 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(scraper.coverage["selection_limits"]["sampled"])
 
 
+    async def test_rss_default_windows_naive_dates_with_legacy_utc(self):
+        feed = '<feed xmlns="http://www.w3.org/2005/Atom"><title>F</title><entry><id>naive</id><title>Naive</title><link href="https://example.com/n"/><published>2026-10-05T12:00:00</published></entry><entry><id>oldnaive</id><title>Old</title><link href="https://example.com/o"/><published>2020-10-05T12:00:00</published></entry><entry><id>none</id><title>None</title><link href="https://example.com/x"/></entry></feed>'
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=feed))) as client:
+            scraper = RSSScraper([RSSSourceConfig(name="F", url="https://example.com/feed")], client)
+            rows = await scraper.fetch(SINCE)
+        self.assertEqual([row.title for row in rows], ["Naive"])
+        self.assertIsNone(rows[0].published_at)
+        self.assertEqual(rows[0].metadata["date_window"], "legacy_utc_assumption")
+        self.assertEqual(scraper.coverage["selection_limits"]["dropped_undated"], 1)
+
+    def test_rss_zoneless_rfc2822_stays_unknown(self):
+        scraper = RSSScraper([], None)
+        self.assertIsNone(scraper._parse_date({"published": "Mon, 05 Oct 2026 12:00:00"}))
+        self.assertEqual(scraper._parse_date({"published": "Mon, 05 Oct 2026 12:00:00 -0000 "}), datetime(2026, 10, 5, 12, tzinfo=timezone.utc))
+
+
 if __name__ == "__main__":
     unittest.main()
