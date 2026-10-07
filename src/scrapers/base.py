@@ -20,6 +20,15 @@ class BaseScraper(ABC):
         """
         self.config = config
         self.client = http_client
+        self.reset_coverage()
+
+    def reset_coverage(self) -> None:
+        """Optional collector diagnostics; callers on older revisions can ignore it."""
+        self.coverage = {"failures": [], "truncated": False, "selection_limits": {}}
+
+    def record_failure(self, stage: str, error: Exception, **identity) -> None:
+        # Never include exception text or request URLs: they may contain credentials.
+        self.coverage["failures"].append({"stage": stage, "error_type": type(error).__name__, **identity})
 
     @abstractmethod
     async def fetch(self, since: datetime) -> List[ContentItem]:

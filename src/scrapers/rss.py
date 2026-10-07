@@ -1,6 +1,5 @@
 """RSS feed scraper implementation."""
 
-import calendar
 import hashlib
 import logging
 import os
@@ -8,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from typing import List
 from email.utils import parsedate_to_datetime
+from dateutil.parser import isoparse
 import httpx
 import feedparser
 
@@ -39,6 +39,8 @@ class RSSScraper(BaseScraper):
             List[ContentItem]: Fetched content items
         """
         items = []
+        self.reset_coverage()
+        self.coverage["selection_limits"] = {"scope": "entries in the returned feed; unknown publication dates retained"}
         sources = self.config["sources"]
 
         for source in sources:
@@ -78,11 +80,14 @@ class RSSScraper(BaseScraper):
 
             # Parse feed
             feed = feedparser.parse(response.text)
+            if feed.bozo:
+                self.record_failure("parse_feed", feed.bozo_exception)
 
             for entry in feed.entries:
                 # Parse published date
                 published_at = self._parse_date(entry)
-                if not published_at or published_at < since:
+                updated_at = self._parse_date(entry, fields=("updated",))
+                if published_at and published_at < since:
                     continue
 
                 # Generate unique ID from feed URL and entry ID
@@ -103,7 +108,11 @@ class RSSScraper(BaseScraper):
                     content=content,
                     author=entry.get("author", source.name),
                     published_at=published_at,
+                    updated_at=updated_at,
                     metadata={
+                        "original_url": entry.get("link", str(source.url)),
+                        "native_entry": dict(entry),
+                        "date_window": "unknown_publication" if published_at is None else "within_window",
                         "feed_name": source.name,
                         "category": source.category,
                         "tags": [tag.term for tag in entry.get("tags", [])],
@@ -112,13 +121,15 @@ class RSSScraper(BaseScraper):
                 items.append(item)
 
         except httpx.HTTPError as e:
-            logger.warning("Error fetching RSS feed %s: %s", source.name, e)
+            self.record_failure("fetch_feed", e)
+            logger.warning("RSS fetch failed (%s)", type(e).__name__)
         except Exception as e:
-            logger.warning("Error parsing RSS feed %s: %s", source.name, e)
+            self.record_failure("parse_feed", e)
+            logger.warning("RSS parse failed (%s)", type(e).__name__)
 
         return items
 
-    def _parse_date(self, entry: dict) -> datetime:
+    def _parse_date(self, entry: dict, fields=("published", "created")) -> datetime | None:
         """Parse publication date from feed entry.
 
         Args:
@@ -128,17 +139,18 @@ class RSSScraper(BaseScraper):
             datetime: Parsed publication date or None
         """
         # Try different date fields
-        for field in ["published", "updated", "created"]:
+        for field in fields:
             if field in entry:
                 try:
-                    # Try parsing structured time first
-                    if f"{field}_parsed" in entry and entry[f"{field}_parsed"]:
-                        return datetime.fromtimestamp(
-                            calendar.timegm(entry[f"{field}_parsed"]), tz=timezone.utc
-                        )
-                    # Fallback to string parsing
+                    # feedparser's structured time can assume UTC for a naive date.
+                    # Parse the original spelling and require an explicit timezone.
                     date_str = entry[field]
-                    return parsedate_to_datetime(date_str)
+                    try:
+                        parsed = parsedate_to_datetime(date_str)
+                    except (TypeError, ValueError):
+                        parsed = isoparse(date_str)
+                    if parsed.tzinfo is not None:
+                        return parsed.astimezone(timezone.utc)
                 except Exception:
                     continue
 

@@ -24,6 +24,13 @@ class HackerNewsScraper(BaseScraper):
         self.base_url = "https://hacker-news.firebaseio.com/v0"
 
     async def fetch(self, since: datetime) -> List[ContentItem]:
+        self.reset_coverage()
+        self.coverage["selection_limits"] = {
+            "top_stories": self.config.get("fetch_top_stories", 30),
+            "comments_per_story": TOP_COMMENTS_LIMIT,
+            "min_score": self.config.get("min_score", 100),
+            "scope": "selected top stories and sampled top-level comments",
+        }
         if not self.config.get("enabled", True):
             return []
 
@@ -33,6 +40,7 @@ class HackerNewsScraper(BaseScraper):
             story_ids = response.json()
 
             fetch_count = self.config.get("fetch_top_stories", 30)
+            self.coverage["truncated"] = len(story_ids) > fetch_count
             story_ids = story_ids[:fetch_count]
 
             # Fetch story details concurrently
@@ -46,10 +54,16 @@ class HackerNewsScraper(BaseScraper):
             comment_tasks = []
             valid_stories = []
 
-            for story in stories:
-                if isinstance(story, Exception) or story is None:
+            for story_id, story in zip(story_ids, stories):
+                if isinstance(story, Exception):
+                    self.record_failure("story", story, native_id=story_id)
+                    continue
+                if story is None or story.get("deleted") or story.get("dead"):
                     continue
                 if story.get("score", 0) < min_score:
+                    continue
+                if "time" not in story:
+                    self.record_failure("story", ValueError(), native_id=story_id)
                     continue
                 published_at = datetime.fromtimestamp(story["time"], tz=timezone.utc)
                 if published_at < since:
@@ -57,6 +71,8 @@ class HackerNewsScraper(BaseScraper):
                 valid_stories.append(story)
                 # Queue comment fetching
                 comment_ids = story.get("kids", [])[:TOP_COMMENTS_LIMIT]
+                if len(story.get("kids", [])) > TOP_COMMENTS_LIMIT:
+                    self.coverage["truncated"] = True
                 comment_tasks.append(self._fetch_comments(comment_ids))
 
             # Fetch all comments concurrently
@@ -64,6 +80,7 @@ class HackerNewsScraper(BaseScraper):
 
             for story, comments in zip(valid_stories, all_comments):
                 if isinstance(comments, Exception):
+                    self.record_failure("comments", comments, native_id=story["id"])
                     comments = []
                 item = self._parse_story(story, comments)
                 if item:
@@ -72,15 +89,20 @@ class HackerNewsScraper(BaseScraper):
             return items
 
         except httpx.HTTPError as e:
-            logger.warning("Error fetching Hacker News stories: %s", e)
+            self.record_failure("top_stories", e)
+            logger.warning("HN fetch failed (%s)", type(e).__name__)
             return []
 
     async def _fetch_story(self, story_id: int) -> Optional[dict]:
         try:
             response = await self.client.get(f"{self.base_url}/item/{story_id}.json")
             response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError:
+            item = response.json()
+            if item is None:
+                self.record_failure("item_unavailable", ValueError(), native_id=story_id)
+            return item
+        except (httpx.HTTPError, ValueError) as e:
+            self.record_failure("item", e, native_id=story_id)
             return None
 
     async def _fetch_comments(self, comment_ids: List[int]) -> List[dict]:
@@ -92,7 +114,9 @@ class HackerNewsScraper(BaseScraper):
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         comments = []
-        for r in results:
+        for comment_id, r in zip(comment_ids, results):
+            if isinstance(r, Exception):
+                self.record_failure("comment", r, native_id=comment_id)
             if isinstance(r, dict) and r.get("text") and not r.get("deleted") and not r.get("dead"):
                 comments.append(r)
         return comments
@@ -133,6 +157,9 @@ class HackerNewsScraper(BaseScraper):
             author=author,
             published_at=published_at,
             metadata={
+                "original_url": url,
+                "native_story": dict(story),
+                "native_comments": comments,
                 "score": story.get("score", 0),
                 "descendants": story.get("descendants", 0),
                 "type": story.get("type", "story"),

@@ -4,6 +4,7 @@ import logging
 import os
 from datetime import datetime
 from typing import List, Optional
+from urllib.parse import urlsplit
 import httpx
 
 from .base import BaseScraper
@@ -50,6 +51,8 @@ class GitHubScraper(BaseScraper):
             List[ContentItem]: Fetched content items
         """
         items = []
+        self.reset_coverage()
+        self.coverage["selection_limits"] = {"release_pages": 5, "releases_per_page": 100}
         sources = self.config["sources"]
 
         for source in sources:
@@ -110,7 +113,8 @@ class GitHubScraper(BaseScraper):
                     items.append(item)
 
         except httpx.HTTPError as e:
-            logger.warning("Error fetching GitHub events for %s: %s", username, e)
+            self.record_failure("user_events", e)
+            logger.warning("GitHub events failed (%s)", type(e).__name__)
 
         return items
 
@@ -188,35 +192,45 @@ class GitHubScraper(BaseScraper):
         items = []
 
         try:
-            response = await self.client.get(url, headers=self._get_headers(), follow_redirects=True)
-            response.raise_for_status()
-            releases = response.json()
+            next_url = url + "?per_page=100"
+            for page in range(1, 6):
+                response = await self.client.get(next_url, headers=self._get_headers(), follow_redirects=True)
+                response.raise_for_status()
+                self.coverage["release_pages_fetched"] = page
+                for release in response.json():
+                    published_at = datetime.fromisoformat(release["published_at"].replace("Z", "+00:00")) if release.get("published_at") else None
+                    if published_at and published_at < since:
+                        continue
+                    item = ContentItem(
+                        id=self._generate_id("github", "release", str(release["id"])),
+                        source_type=SourceType.GITHUB,
+                        title=f"{owner}/{repo} released {release['tag_name']}",
+                        url=release["html_url"],
+                        content=release.get("body", ""),
+                        author=release["author"]["login"],
+                        published_at=published_at,
+                        updated_at=datetime.fromisoformat(release["updated_at"].replace("Z", "+00:00")) if release.get("updated_at") else None,
+                        metadata={
+                            "original_url": release["html_url"],
+                            "native_release": dict(release),
+                            "repo": f"{owner}/{repo}",
+                            "tag": release["tag_name"],
+                            "prerelease": release.get("prerelease", False),
+                        }
+                    )
+                    items.append(item)
+                following = response.links.get("next", {}).get("url")
+                if not following:
+                    break
+                parts = urlsplit(following)
+                if parts.scheme != "https" or parts.netloc != "api.github.com" or parts.path != urlsplit(url).path:
+                    raise ValueError("Unexpected release pagination target")
+                next_url = following
+                if page == 5:
+                    self.coverage["truncated"] = True
 
-            for release in releases:
-                published_at = datetime.fromisoformat(
-                    release["published_at"].replace("Z", "+00:00")
-                )
-
-                if published_at < since:
-                    continue
-
-                item = ContentItem(
-                    id=self._generate_id("github", "release", str(release["id"])),
-                    source_type=SourceType.GITHUB,
-                    title=f"{owner}/{repo} released {release['tag_name']}",
-                    url=release["html_url"],
-                    content=release.get("body", ""),
-                    author=release["author"]["login"],
-                    published_at=published_at,
-                    metadata={
-                        "repo": f"{owner}/{repo}",
-                        "tag": release["tag_name"],
-                        "prerelease": release.get("prerelease", False),
-                    }
-                )
-                items.append(item)
-
-        except httpx.HTTPError as e:
-            logger.warning("Error fetching releases for %s/%s: %s", owner, repo, e)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            self.record_failure("repo_releases", e)
+            logger.warning("GitHub releases failed (%s)", type(e).__name__)
 
         return items
