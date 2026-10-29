@@ -3,13 +3,17 @@
 import asyncio
 import glob
 import hashlib
+import argparse
 import json
 import logging
 import os
 import random
+import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlsplit
 
 from ..models import ContentItem, SourceType, TwitterConfig
 from .base import BaseScraper
@@ -61,20 +65,164 @@ def _load_browser_cookies(file_path: str) -> list[dict]:
     return pw_cookies
 
 
+_STATUS_HOSTS = {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+_USERNAME_RE = re.compile(r"[A-Za-z0-9_]{1,15}")
+_TWEET_ID_RE = re.compile(r"[0-9]{1,25}")
+_LOGIN_GATE_MARKERS = ("log in", "sign up", "create account")
+_UNAVAILABLE_MARKERS = (
+    "post is unavailable",
+    "tweet is unavailable",
+    "page doesn’t exist",
+    "page doesn't exist",
+    "posts are protected",
+    "post was deleted",
+    "account that no longer exists",
+)
+
+
+def parse_status_url(url: str) -> tuple[str, str]:
+    """Return (username, tweet_id) for an X/Twitter post URL; raise ValueError otherwise."""
+    try:
+        parts = urlsplit(str(url).strip())
+        host = (parts.hostname or "").lower()
+        has_userinfo = "@" in parts.netloc
+    except ValueError as exc:
+        raise ValueError("Not a valid URL") from exc
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("Status URL must use http(s)")
+    if has_userinfo:
+        raise ValueError("Status URL must not contain credentials")
+    if host not in _STATUS_HOSTS:
+        raise ValueError("Status URL must be on x.com or twitter.com")
+    segments = [seg for seg in parts.path.split("/") if seg]
+    if (
+        len(segments) < 3
+        or segments[1] not in ("status", "statuses")
+        or not _USERNAME_RE.fullmatch(segments[0])
+        or not _TWEET_ID_RE.fullmatch(segments[2])
+    ):
+        raise ValueError("Status URL needs the form /<user>/status/<numeric id>")
+    return segments[0], segments[2]
+
+
+async def _block_heavy_resources(route):
+    if route.request.resource_type in ("media", "image", "video"):
+        await route.abort()
+    else:
+        url = route.request.url.lower()
+        if any(k in url for k in ("google-analytics", "doubleclick", "scribe.twitter.com")):
+            await route.abort()
+        else:
+            await route.continue_()
+
+
+def _tweet_author(obj: dict) -> str:
+    user = obj.get("core", {}).get("user_results", {}).get("result", {})
+    if user.get("__typename") == "UserUnavailable":
+        return ""
+    return user.get("core", {}).get("screen_name") or user.get("legacy", {}).get("screen_name") or ""
+
+
+def _extract_tweets(obj, out: list[dict]) -> None:
+    """Append every GraphQL object that looks like a tweet (rest_id + legacy) to out."""
+    if isinstance(obj, dict):
+        if obj.get("rest_id") and obj.get("legacy"):
+            legacy = obj["legacy"]
+            media_entities = (
+                legacy.get("extended_entities", {}).get("media", [])
+                or legacy.get("entities", {}).get("media", [])
+            )
+            images = [
+                m["media_url_https"]
+                for m in media_entities
+                if m.get("type") == "photo" and m.get("media_url_https")
+            ]
+            tweet = {
+                "tweet_id": obj["rest_id"],
+                "text": legacy.get("full_text", ""),
+                "datetime_raw": legacy.get("created_at", ""),
+                "is_retweet": (
+                    "retweeted_status_result" in obj.get("core", {})
+                    or "retweeted_status_id_str" in legacy
+                ),
+                "images": images,
+            }
+            try:
+                dt = datetime.strptime(tweet["datetime_raw"], "%a %b %d %H:%M:%S %z %Y")
+                tweet["datetime"] = dt.isoformat()
+            except (ValueError, TypeError):
+                tweet["datetime"] = tweet["datetime_raw"]
+            # Extra fields read by the status path; _parse_tweet ignores them.
+            tweet["username"] = _tweet_author(obj)
+            tweet["conversation_id"] = legacy.get("conversation_id_str")
+            tweet["in_reply_to"] = legacy.get("in_reply_to_status_id_str")
+            tweet["like_count"] = legacy.get("favorite_count")
+            tweet["reply_count"] = legacy.get("reply_count")
+            quoted = legacy.get("quoted_status_permalink", {})
+            tweet["quoted_status_url"] = quoted.get("expanded") if isinstance(quoted, dict) else None
+            note = obj.get("note_tweet", {}).get("note_tweet_results", {}).get("result", {})
+            tweet["note_text"] = note.get("text") if isinstance(note, dict) else None
+            out.append(tweet)
+        for v in obj.values():
+            _extract_tweets(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_tweets(item, out)
+
+
+def select_status_thread(tweets: list[dict], tweet_id: str, max_replies: int) -> Optional[list[dict]]:
+    """Pick the requested post, its author's thread and up to max_replies replies by others.
+
+    Returns None when the requested post is not among the intercepted tweets.
+    Each returned dict carries "kind": "status", "thread" or "reply".
+    """
+    unique: dict[str, dict] = {}
+    for t in tweets:
+        tid = str(t.get("tweet_id") or "")
+        # User objects also have rest_id + legacy; only tweets have a conversation id.
+        if tid and t.get("conversation_id") and tid not in unique:
+            unique[tid] = t
+    root = unique.get(str(tweet_id))
+    if root is None:
+        return None
+    conversation = root.get("conversation_id") or root["tweet_id"]
+    author = (root.get("username") or "").lower()
+    selected = [{**root, "kind": "status"}]
+    replies = 0
+    for tid, t in unique.items():
+        if tid == root["tweet_id"] or t.get("conversation_id") != conversation:
+            continue
+        if author and (t.get("username") or "").lower() == author:
+            selected.append({**t, "kind": "thread"})
+        elif replies < max_replies:
+            selected.append({**t, "kind": "reply"})
+            replies += 1
+    return selected
+
+
 class TwitterPlaywrightScraper(BaseScraper):
     """Fetch tweets via Playwright + Cookie using GraphQL interception (free alternative to Apify)."""
 
     def __init__(self, config: TwitterConfig, http_client=None):
         super().__init__(config.model_dump(), http_client)
         self.twitter_config = config
+        # "@user/status/id" labels of status URLs that could not be read in the last fetch()
+        self.failed_status_urls: list[str] = []
 
     async def fetch(self, since: datetime) -> List[ContentItem]:
         if not self.twitter_config.enabled:
             return []
 
         users = [u.strip().lstrip("@") for u in self.twitter_config.users if u.strip()]
-        if not users:
-            logger.debug("No Twitter users configured, skipping.")
+        self.failed_status_urls = []
+        statuses: list[tuple[str, str]] = []
+        for raw_url in self.twitter_config.status_urls:
+            try:
+                statuses.append(parse_status_url(raw_url))
+            except ValueError as exc:
+                logger.warning("Skipping invalid status URL: %s", exc)
+        if not users and not statuses:
+            logger.debug("No Twitter users or status URLs configured, skipping.")
             return []
 
         if not PLAYWRIGHT_AVAILABLE:
@@ -91,8 +239,9 @@ class TwitterPlaywrightScraper(BaseScraper):
             return []
 
         logger.info(
-            "Fetching Twitter (Playwright) for %d users using %d cookie sets",
+            "Fetching Twitter (Playwright) for %d users and %d status URLs using %d cookie sets",
             len(users),
+            len(statuses),
             len(cookie_files),
         )
 
@@ -190,6 +339,30 @@ class TwitterPlaywrightScraper(BaseScraper):
                     if q
                 ])
 
+            async def process_status_queue(context_idx: int, queue: list[tuple[str, str]]):
+                ctx = contexts[context_idx]
+                for username, tweet_id in queue:
+                    await asyncio.sleep(random.uniform(5.0, 10.0))
+                    label = f"@{username}/status/{tweet_id}"
+                    logger.info("Reading %s with cookie #%d...", label, context_idx + 1)
+                    tweets = await self._scrape_status(ctx, f"https://x.com/{username}/status/{tweet_id}")
+                    if tweets is None:
+                        async with lock:
+                            self.failed_status_urls.append(label)
+                        continue
+                    parsed = [item for item in (self._parse_status_tweet(t, username) for t in tweets) if item]
+                    logger.info("  -> %s: %d items", label, len(parsed))
+                    async with lock:
+                        all_items.extend(parsed)
+
+            if statuses:
+                status_queues: list[list[tuple[str, str]]] = [[] for _ in range(num_contexts)]
+                for i, status in enumerate(statuses):
+                    status_queues[i % num_contexts].append(status)
+                await asyncio.gather(*[
+                    process_status_queue(i, q) for i, q in enumerate(status_queues) if q
+                ])
+
             for ctx in contexts:
                 await ctx.close()
             await browser.close()
@@ -207,60 +380,14 @@ class TwitterPlaywrightScraper(BaseScraper):
                 return
             try:
                 data = await response.json()
-
-                def extract_tweets(obj):
-                    if isinstance(obj, dict):
-                        if obj.get("rest_id") and obj.get("legacy"):
-                            legacy = obj["legacy"]
-                            media_entities = (
-                                legacy.get("extended_entities", {}).get("media", [])
-                                or legacy.get("entities", {}).get("media", [])
-                            )
-                            images = [
-                                m["media_url_https"]
-                                for m in media_entities
-                                if m.get("type") == "photo" and m.get("media_url_https")
-                            ]
-                            tweet = {
-                                "tweet_id": obj["rest_id"],
-                                "text": legacy.get("full_text", ""),
-                                "datetime_raw": legacy.get("created_at", ""),
-                                "is_retweet": (
-                                    "retweeted_status_result" in obj.get("core", {})
-                                    or "retweeted_status_id_str" in legacy
-                                ),
-                                "images": images,
-                            }
-                            try:
-                                dt = datetime.strptime(tweet["datetime_raw"], "%a %b %d %H:%M:%S %z %Y")
-                                tweet["datetime"] = dt.isoformat()
-                            except (ValueError, TypeError):
-                                tweet["datetime"] = tweet["datetime_raw"]
-                            graphql_tweets.append(tweet)
-                        for v in obj.values():
-                            extract_tweets(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            extract_tweets(item)
-
-                extract_tweets(data)
+                _extract_tweets(data, graphql_tweets)
             except Exception as exc:
                 logger.debug("GraphQL parse error: %s", exc)
 
         page.on("response", handle_response)
 
         # Block heavy resources
-        async def route_handler(route):
-            if route.request.resource_type in ("media", "image", "video"):
-                await route.abort()
-            else:
-                url = route.request.url.lower()
-                if any(k in url for k in ("google-analytics", "doubleclick", "scribe.twitter.com")):
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-        await page.route("**/*", route_handler)
+        await page.route("**/*", _block_heavy_resources)
 
         try:
             await asyncio.sleep(random.uniform(2, 4))
@@ -347,6 +474,118 @@ class TwitterPlaywrightScraper(BaseScraper):
         finally:
             await page.close()
 
+    async def _scrape_status(self, ctx, status_url: str) -> Optional[list[dict]]:
+        """Read one post with its thread via TweetDetail interception; None when it cannot be read."""
+        try:
+            username, tweet_id = parse_status_url(status_url)
+        except ValueError as exc:
+            logger.warning("Invalid status URL: %s", exc)
+            return None
+        label = f"@{username}/status/{tweet_id}"
+        max_replies = self.twitter_config.status_max_replies
+        page = await ctx.new_page()
+        graphql_tweets: list[dict] = []
+
+        async def handle_response(response):
+            if "TweetDetail" not in response.url and "TweetResultByRestId" not in response.url:
+                return
+            try:
+                _extract_tweets(await response.json(), graphql_tweets)
+            except Exception as exc:
+                logger.debug("GraphQL parse error: %s", exc)
+
+        page.on("response", handle_response)
+        await page.route("**/*", _block_heavy_resources)
+
+        try:
+            await asyncio.sleep(random.uniform(2, 4))
+            for attempt in range(3):
+                if attempt > 0:
+                    await asyncio.sleep(random.uniform(5, 10))
+                try:
+                    await page.goto(
+                        f"https://x.com/{username}/status/{tweet_id}",
+                        wait_until="domcontentloaded",
+                        timeout=25000,
+                    )
+                    break
+                except Exception as exc:
+                    if "Timeout" in str(exc):
+                        logger.debug("Page load slow (attempt %d/3)", attempt + 1)
+                        if attempt == 2:
+                            break
+                    else:
+                        if attempt == 2:
+                            raise
+                        logger.debug("Page visit error (attempt %d/3): %s", attempt + 1, exc)
+
+            await asyncio.sleep(5)
+            start_time = asyncio.get_event_loop().time()
+            scrolls_with_root = 0
+
+            # Bounded by polls as well as time; each poll waits 2-4 s.
+            for _ in range(20):
+                if (asyncio.get_event_loop().time() - start_time) >= 60:
+                    break
+                selected = select_status_thread(graphql_tweets, tweet_id, max_replies)
+                if selected is not None:
+                    replies = sum(1 for t in selected if t["kind"] == "reply")
+                    if replies >= max_replies or scrolls_with_root >= 3:
+                        break
+                    scrolls_with_root += 1
+                else:
+                    if "/login" in page.url or "/i/flow/" in page.url:
+                        logger.warning("  -> %s: redirected to login — cookies may be expired", label)
+                        return None
+                    body_text = await page.evaluate("document.body ? document.body.innerText : ''") or ""
+                    lowered = body_text.lower().replace("\u2019", "'")
+                    if any(k in lowered for k in _UNAVAILABLE_MARKERS):
+                        logger.warning("  -> %s: post deleted, protected or unavailable", label)
+                        return None
+                    if not graphql_tweets and any(k in lowered for k in _LOGIN_GATE_MARKERS):
+                        logger.warning("  -> %s: page shows login gate — cookies may be expired", label)
+                        return None
+                    if any(kw in body_text for kw in ("Retry", "Something went wrong", "出错了", "重新加载")):
+                        await page.reload(wait_until="load", timeout=30000)
+                        await asyncio.sleep(5)
+
+                # Scroll to load more of the reply thread
+                await page.mouse.move(random.randint(100, 600), random.randint(100, 600))
+                await page.evaluate(f"window.scrollBy(0, {random.randint(300, 700)})")
+                await asyncio.sleep(random.uniform(2, 4))
+
+            selected = select_status_thread(graphql_tweets, tweet_id, max_replies)
+            if selected is not None:
+                return selected
+            if not graphql_tweets:
+                logger.warning("  -> %s: no GraphQL data intercepted (cookie or page issue)", label)
+            else:
+                logger.warning("  -> %s: requested post not in GraphQL data (deleted or no access)", label)
+            return None
+
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", label, exc)
+            return None
+        finally:
+            await page.close()
+
+    def _parse_status_tweet(self, tweet: dict, fallback_username: str) -> Optional[ContentItem]:
+        """Convert a tweet from select_status_thread to a ContentItem with thread metadata."""
+        username = tweet.get("username") or fallback_username
+        item = self._parse_tweet({**tweet, "text": tweet.get("note_text") or tweet.get("text", "")}, username)
+        if item is None:
+            return None
+        item.metadata.update({
+            "kind": tweet.get("kind", "status"),
+            "conversation_id": tweet.get("conversation_id"),
+            "in_reply_to": tweet.get("in_reply_to"),
+            "like_count": tweet.get("like_count"),
+            "reply_count": tweet.get("reply_count"),
+        })
+        if tweet.get("quoted_status_url"):
+            item.metadata["quoted_status_url"] = tweet["quoted_status_url"]
+        return item
+
     def _parse_tweet(self, tweet: dict, username: str) -> Optional[ContentItem]:
         """Convert raw tweet dict to Horizon ContentItem."""
         try:
@@ -387,3 +626,71 @@ class TwitterPlaywrightScraper(BaseScraper):
         except Exception as exc:
             logger.debug("Failed to parse tweet: %s", exc)
             return None
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Read one X post with its replies and write {"items": [...]}; no LLM, scoring or notifications.
+
+    Exit codes: 0 success, 1 invalid URL or configuration, 2 the post could not be read.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python -m src.scrapers.twitter_playwright",
+        description="Read one X post and its reply thread with exported browser cookies (read-only).",
+    )
+    parser.add_argument("--status-url", required=True, help="https://x.com/<user>/status/<id>")
+    parser.add_argument("--cookie-dir", default="data", help="Directory with x_cookies_*.json (default: data)")
+    parser.add_argument("--out", help="Output JSON file (default: stdout)")
+    parser.add_argument("--max-replies", type=int, default=TwitterConfig().status_max_replies)
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
+
+    try:
+        username, tweet_id = parse_status_url(args.status_url)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.max_replies < 0:
+        print("error: --max-replies must be >= 0", file=sys.stderr)
+        return 1
+    if not PLAYWRIGHT_AVAILABLE:
+        print(
+            "error: Playwright not installed. Run: uv sync --extra twitter && uv run playwright install chromium",
+            file=sys.stderr,
+        )
+        return 1
+
+    config = TwitterConfig(
+        enabled=True,
+        mode="playwright",
+        users=[],
+        status_urls=[f"https://x.com/{username}/status/{tweet_id}"],
+        status_max_replies=args.max_replies,
+        cookie_dir=args.cookie_dir,
+    )
+    if not sorted(Path(config.cookie_dir).glob(config.cookie_file_pattern)):
+        print(f"error: no {config.cookie_file_pattern} in {config.cookie_dir}", file=sys.stderr)
+        return 2
+
+    scraper = TwitterPlaywrightScraper(config)
+    items = asyncio.run(scraper.fetch(datetime.now(timezone.utc)))
+    if scraper.failed_status_urls or not items:
+        print(f"error: could not read @{username}/status/{tweet_id}", file=sys.stderr)
+        return 2
+
+    payload = json.dumps({"items": [item.model_dump(mode="json") for item in items]}, ensure_ascii=False, indent=2)
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload + "\n", encoding="utf-8")
+    else:
+        sys.stdout.buffer.write((payload + "\n").encode("utf-8"))
+    kinds = {k: sum(1 for i in items if i.metadata.get("kind") == k) for k in ("status", "thread", "reply")}
+    print(
+        f"ok: {len(items)} items ({kinds['status']} status, {kinds['thread']} thread, {kinds['reply']} replies)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
