@@ -96,6 +96,9 @@ def parse_status_url(url: str) -> tuple[str, str]:
     if host not in _STATUS_HOSTS:
         raise ValueError("Status URL must be on x.com or twitter.com")
     segments = [seg for seg in parts.path.split("/") if seg]
+    # /i/web/status/<id> (notification and e-mail links); x.com/i/status/<id> redirects to the post
+    if segments[:2] == ["i", "web"]:
+        segments = ["i"] + segments[2:]
     if (
         len(segments) < 3
         or segments[1] not in ("status", "statuses")
@@ -117,33 +120,40 @@ async def _block_heavy_resources(route):
             await route.continue_()
 
 
+def _obj(parent: dict, key: str) -> dict:
+    """parent[key] when it is a dict, else {} (GraphQL fields may be null)."""
+    value = parent.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def _tweet_author(obj: dict) -> str:
-    user = obj.get("core", {}).get("user_results", {}).get("result", {})
+    user = _obj(_obj(_obj(obj, "core"), "user_results"), "result")
     if user.get("__typename") == "UserUnavailable":
         return ""
-    return user.get("core", {}).get("screen_name") or user.get("legacy", {}).get("screen_name") or ""
+    return _obj(user, "core").get("screen_name") or _obj(user, "legacy").get("screen_name") or ""
 
 
 def _extract_tweets(obj, out: list[dict]) -> None:
     """Append every GraphQL object that looks like a tweet (rest_id + legacy) to out."""
     if isinstance(obj, dict):
-        if obj.get("rest_id") and obj.get("legacy"):
+        if obj.get("rest_id") and isinstance(obj.get("legacy"), dict) and obj["legacy"]:
             legacy = obj["legacy"]
             media_entities = (
-                legacy.get("extended_entities", {}).get("media", [])
-                or legacy.get("entities", {}).get("media", [])
+                _obj(legacy, "extended_entities").get("media")
+                or _obj(legacy, "entities").get("media")
+                or []
             )
             images = [
                 m["media_url_https"]
                 for m in media_entities
-                if m.get("type") == "photo" and m.get("media_url_https")
+                if isinstance(m, dict) and m.get("type") == "photo" and m.get("media_url_https")
             ]
             tweet = {
                 "tweet_id": obj["rest_id"],
-                "text": legacy.get("full_text", ""),
-                "datetime_raw": legacy.get("created_at", ""),
+                "text": legacy.get("full_text") or "",
+                "datetime_raw": legacy.get("created_at") or "",
                 "is_retweet": (
-                    "retweeted_status_result" in obj.get("core", {})
+                    "retweeted_status_result" in _obj(obj, "core")
                     or "retweeted_status_id_str" in legacy
                 ),
                 "images": images,
@@ -159,10 +169,8 @@ def _extract_tweets(obj, out: list[dict]) -> None:
             tweet["in_reply_to"] = legacy.get("in_reply_to_status_id_str")
             tweet["like_count"] = legacy.get("favorite_count")
             tweet["reply_count"] = legacy.get("reply_count")
-            quoted = legacy.get("quoted_status_permalink", {})
-            tweet["quoted_status_url"] = quoted.get("expanded") if isinstance(quoted, dict) else None
-            note = obj.get("note_tweet", {}).get("note_tweet_results", {}).get("result", {})
-            tweet["note_text"] = note.get("text") if isinstance(note, dict) else None
+            tweet["quoted_status_url"] = _obj(legacy, "quoted_status_permalink").get("expanded")
+            tweet["note_text"] = _obj(_obj(_obj(obj, "note_tweet"), "note_tweet_results"), "result").get("text")
             out.append(tweet)
         for v in obj.values():
             _extract_tweets(v, out)
@@ -217,11 +225,11 @@ class TwitterPlaywrightScraper(BaseScraper):
         users = [u.strip().lstrip("@") for u in self.twitter_config.users if u.strip()]
         self.failed_status_urls = []
         statuses: list[tuple[str, str]] = []
-        for raw_url in self.twitter_config.status_urls:
+        for index, raw_url in enumerate(self.twitter_config.status_urls, start=1):
             try:
                 statuses.append(parse_status_url(raw_url))
             except ValueError as exc:
-                logger.warning("Skipping invalid status URL: %s", exc)
+                logger.warning("Skipping invalid status URL #%d of status_urls: %s", index, exc)
         if not users and not statuses:
             logger.debug("No Twitter users or status URLs configured, skipping.")
             return []
@@ -573,7 +581,10 @@ class TwitterPlaywrightScraper(BaseScraper):
     def _parse_status_tweet(self, tweet: dict, fallback_username: str) -> Optional[ContentItem]:
         """Convert a tweet from select_status_thread to a ContentItem with thread metadata."""
         username = tweet.get("username") or fallback_username
-        item = self._parse_tweet({**tweet, "text": tweet.get("note_text") or tweet.get("text", "")}, username)
+        text = tweet.get("note_text") or tweet.get("text") or ""
+        if not text and tweet.get("kind") == "status":
+            text = "(no text; media only)"  # keep the requested post even without text
+        item = self._parse_tweet({**tweet, "text": text}, username)
         if item is None:
             return None
         item.metadata.update({
@@ -629,12 +640,21 @@ class TwitterPlaywrightScraper(BaseScraper):
             return None
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """Usage errors exit 1 (configuration), keeping 2 for "the post could not be read"."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """Read one X post with its replies and write {"items": [...]}; no LLM, scoring or notifications.
 
     Exit codes: 0 success, 1 invalid URL or configuration, 2 the post could not be read.
     """
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="python -m src.scrapers.twitter_playwright",
         description="Read one X post and its reply thread with exported browser cookies (read-only).",
     )

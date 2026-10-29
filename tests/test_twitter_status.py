@@ -493,3 +493,130 @@ def test_cookie_file_with_utf8_bom_loads(tmp_path):
     cookie_file = tmp_path / "x_cookies_1.json"
     cookie_file.write_bytes(b"\xef\xbb\xbf" + json.dumps([{"name": "n", "value": "synthetic", "domain": ".x.com"}]).encode())
     assert tp._load_browser_cookies(str(cookie_file))[0]["name"] == "n"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+def test_parse_status_url_accepts_i_web_status():
+    assert parse_status_url("https://x.com/i/web/status/1800000000000000001") == ("i", "1800000000000000001")
+    assert parse_status_url("https://twitter.com/i/status/1800000000000000001") == ("i", "1800000000000000001")
+
+
+def test_scrape_status_i_web_url_uses_graphql_author(no_sleep):
+    page = FakePage(responses=[FakeResponse(DETAIL_URL, tweet_detail_payload())])
+    scraper = TwitterPlaywrightScraper(_config())
+    tweets = asyncio.run(scraper._scrape_status(FakeContext(lambda: page), f"https://x.com/i/web/status/{ROOT_ID}"))
+    item = scraper._parse_status_tweet(tweets[0], "i")
+    assert page.visited == [f"https://x.com/i/status/{ROOT_ID}"]
+    assert str(item.url) == f"https://x.com/alice/status/{ROOT_ID}"
+
+
+def test_extract_tolerates_null_fields():
+    bad = _tweet("1800000000000000007", "erin", "null fields", reply_to=ROOT_ID)
+    bad["note_tweet"] = None
+    bad["core"] = None
+    bad["legacy"]["extended_entities"] = None
+    bad["legacy"]["quoted_status_permalink"] = None
+    payload = tweet_detail_payload()
+    payload["data"]["extra"] = [bad, {"rest_id": "x", "legacy": None}]
+    tweets = _extract(payload)
+    ids = {t["tweet_id"] for t in tweets}
+    assert ROOT_ID in ids and "1800000000000000007" in ids
+    assert next(t for t in tweets if t["tweet_id"] == "1800000000000000007")["username"] == ""
+
+
+def test_media_only_root_is_kept():
+    scraper = TwitterPlaywrightScraper(_config())
+    item = scraper._parse_status_tweet(
+        {"tweet_id": ROOT_ID, "text": "", "datetime": "2026-10-01T12:00:00+00:00", "kind": "status", "images": ["i.jpg"]},
+        "alice",
+    )
+    assert item is not None and item.metadata["kind"] == "status"
+    reply = scraper._parse_status_tweet(
+        {"tweet_id": "9", "text": "", "datetime": "2026-10-01T12:00:00+00:00", "kind": "reply"}, "bob"
+    )
+    assert reply is None
+
+
+def test_max_replies_zero_keeps_root_and_thread():
+    selected = select_status_thread(_extract(tweet_detail_payload()), ROOT_ID, max_replies=0)
+    assert [t["kind"] for t in selected] == ["status", "thread"]
+
+
+def test_scrape_status_reads_tweet_result_by_rest_id(no_sleep):
+    root = _tweet(ROOT_ID, "alice", "single result", minutes_ago=5)
+    payload = {"data": {"tweetResult": {"result": root}}}
+    page = FakePage(responses=[FakeResponse("https://x.com/i/api/graphql/q/TweetResultByRestId?v=1", payload)])
+    result = asyncio.run(TwitterPlaywrightScraper(_config())._scrape_status(FakeContext(lambda: page), STATUS_URL))
+    assert [t["kind"] for t in result] == ["status"]
+
+
+class CountingPage(FakePage):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.evaluations = 0
+        self.reloads = 0
+
+    async def evaluate(self, script):
+        self.evaluations += 1
+        return await super().evaluate(script)
+
+    async def reload(self, **kwargs):
+        self.reloads += 1
+
+
+def test_scrape_status_scrolls_a_bounded_number_of_times_for_replies(no_sleep):
+    page = CountingPage(responses=[FakeResponse(DETAIL_URL, tweet_detail_payload())])
+    result = asyncio.run(TwitterPlaywrightScraper(_config())._scrape_status(FakeContext(lambda: page), STATUS_URL))
+    # 3 replies < 20 requested: three extra scroll rounds, then the root is returned
+    assert len([t for t in result if t["kind"] == "reply"]) == 3
+    assert page.evaluations == 3
+
+
+def test_scrape_status_error_page_reloads_then_gives_up(no_sleep):
+    page = CountingPage(body_text="Something went wrong. Try reloading. Retry")
+    result = asyncio.run(TwitterPlaywrightScraper(_config())._scrape_status(FakeContext(lambda: page), STATUS_URL))
+    assert result is None
+    assert page.reloads == 20  # one per poll, bounded
+
+
+def test_scrape_status_unavailable_after_partial_graphql(no_sleep):
+    other = {"data": {"x": _tweet("1700000000000000001", "carol", "other conv", conversation="1700000000000000001")}}
+    page = FakePage(responses=[FakeResponse(DETAIL_URL, other)], body_text="This post is unavailable.")
+    result = asyncio.run(TwitterPlaywrightScraper(_config())._scrape_status(FakeContext(lambda: page), STATUS_URL))
+    assert result is None
+
+
+def test_scrape_status_warnings_omit_tracking_parameters(no_sleep, caplog):
+    page = FakePage(url="https://x.com/i/flow/login")
+    with caplog.at_level("WARNING"):
+        asyncio.run(TwitterPlaywrightScraper(_config())._scrape_status(FakeContext(lambda: page), STATUS_URL))
+    assert caplog.records
+    assert all("tracking" not in r.getMessage() and "t=" not in r.getMessage() for r in caplog.records)
+
+
+def test_fetch_runs_profiles_then_statuses(fake_browser, monkeypatch):
+    scraper = TwitterPlaywrightScraper(_config(users=["alice"], status_urls=[STATUS_URL], cookie_dir=str(fake_browser)))
+    order = []
+
+    async def fake_user(ctx, username, since):
+        order.append("user")
+        return [{"tweet_id": "11", "text": "recent", "datetime": "2026-10-01T12:00:00+00:00"}]
+
+    async def fake_status(ctx, url):
+        order.append("status")
+        return select_status_thread(_extract(tweet_detail_payload()), ROOT_ID, 20)
+
+    monkeypatch.setattr(scraper, "_scrape_user", fake_user)
+    monkeypatch.setattr(scraper, "_scrape_status", fake_status)
+    items = asyncio.run(scraper.fetch(datetime(2026, 1, 1, tzinfo=timezone.utc)))
+    assert order == ["user", "status"]
+    assert items[0].id == "twitter:tweet:11" and len(items) == 6
+
+
+def test_cli_unknown_flag_exits_1(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        tp.main(["--status-url", STATUS_URL, "--cookies", str(tmp_path)])
+    assert exc.value.code == 1
