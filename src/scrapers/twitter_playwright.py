@@ -47,7 +47,8 @@ def _load_browser_cookies(file_path: str) -> list[dict]:
     """Read browser-exported cookie JSON and convert to Playwright format."""
     if not Path(file_path).exists():
         return []
-    with open(file_path, encoding="utf-8") as f:
+    # utf-8-sig: Windows PowerShell writes a BOM with -Encoding utf8
+    with open(file_path, encoding="utf-8-sig") as f:
         cookies = json.load(f)
     pw_cookies = []
     for c in cookies:

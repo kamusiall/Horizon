@@ -487,3 +487,9 @@ def test_cli_writes_import_ready_items(fake_browser, monkeypatch):
         assert item["url"].startswith("https://x.com/")
         assert item["title"] and item["content"]
         assert datetime.fromisoformat(item["published_at"]).tzinfo is not None
+
+
+def test_cookie_file_with_utf8_bom_loads(tmp_path):
+    cookie_file = tmp_path / "x_cookies_1.json"
+    cookie_file.write_bytes(b"\xef\xbb\xbf" + json.dumps([{"name": "n", "value": "synthetic", "domain": ".x.com"}]).encode())
+    assert tp._load_browser_cookies(str(cookie_file))[0]["name"] == "n"
