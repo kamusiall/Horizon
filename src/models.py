@@ -28,7 +28,8 @@ class ContentItem(BaseModel):
     url: HttpUrl
     content: Optional[str] = None
     author: Optional[str] = None
-    published_at: datetime
+    published_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: Dict[str, Any] = Field(default_factory=dict)
 

@@ -7,6 +7,9 @@ import httpx
 
 from ..models import ContentItem
 
+# Bumped when coverage/date semantics change; adapters read it without importing.
+COLLECTOR_CONTRACT = 1
+
 
 class BaseScraper(ABC):
     """Abstract base class for all scrapers."""
@@ -20,6 +23,16 @@ class BaseScraper(ABC):
         """
         self.config = config
         self.client = http_client
+        self.reset_coverage()
+
+    def reset_coverage(self) -> None:
+        """Optional collector diagnostics; callers on older revisions can ignore it."""
+        # Collectors that fill failures/truncation/selection_limits set instrumented=True.
+        self.coverage = {"instrumented": False, "failures": [], "truncated": False, "selection_limits": {}}
+
+    def record_failure(self, stage: str, error: Exception, **identity) -> None:
+        # Never include exception text or request URLs: they may contain credentials.
+        self.coverage["failures"].append({"stage": stage, "error_type": type(error).__name__, **identity})
 
     @abstractmethod
     async def fetch(self, since: datetime) -> List[ContentItem]:

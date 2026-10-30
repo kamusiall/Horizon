@@ -2,8 +2,10 @@
 
 import logging
 import os
+import re
 from datetime import datetime
 from typing import List, Optional
+from urllib.parse import urlsplit
 import httpx
 
 from .base import BaseScraper
@@ -50,6 +52,9 @@ class GitHubScraper(BaseScraper):
             List[ContentItem]: Fetched content items
         """
         items = []
+        self.reset_coverage()
+        self.coverage["instrumented"] = True
+        self.coverage["selection_limits"] = {"release_pages": 5, "releases_per_page": 100}
         sources = self.config["sources"]
 
         for source in sources:
@@ -110,7 +115,8 @@ class GitHubScraper(BaseScraper):
                     items.append(item)
 
         except httpx.HTTPError as e:
-            logger.warning("Error fetching GitHub events for %s: %s", username, e)
+            self.record_failure("user_events", e)
+            logger.warning("GitHub events failed (%s)", type(e).__name__)
 
         return items
 
@@ -185,38 +191,60 @@ class GitHubScraper(BaseScraper):
             List[ContentItem]: Release content items
         """
         url = f"{self.base_url}/repos/{owner}/{repo}/releases"
+        repo_name = f"{owner}/{repo}"
+        allowed_paths = re.compile(r"^(%s|/repositories/\d+/releases)$" % re.escape(urlsplit(url).path))
         items = []
 
         try:
-            response = await self.client.get(url, headers=self._get_headers(), follow_redirects=True)
-            response.raise_for_status()
-            releases = response.json()
+            next_url = url + "?per_page=100"
+            for page in range(1, 6):
+                response = await self.client.get(next_url, headers=self._get_headers(), follow_redirects=True)
+                response.raise_for_status()
+                self.coverage["release_pages_fetched"] = page
+                in_window = False
+                for release in response.json():
+                    native_id = release.get("id") if isinstance(release, dict) else None
+                    try:
+                        if release.get("draft"):
+                            continue  # unpublished; visible only to push-capable tokens
+                        published_at = datetime.fromisoformat(release["published_at"].replace("Z", "+00:00")) if release.get("published_at") else None
+                        if published_at and published_at < since:
+                            continue
+                        in_window = True
+                        items.append(ContentItem(
+                            id=self._generate_id("github", "release", str(release["id"])),
+                            source_type=SourceType.GITHUB,
+                            title=f"{repo_name} released {release['tag_name']}",
+                            url=release["html_url"],
+                            content=release.get("body", ""),
+                            author=release["author"]["login"],
+                            published_at=published_at,
+                            updated_at=datetime.fromisoformat(release["updated_at"].replace("Z", "+00:00")) if release.get("updated_at") else None,
+                            metadata={
+                                "original_url": release["html_url"],
+                                "native_release": dict(release),
+                                "repo": repo_name,
+                                "tag": release["tag_name"],
+                                "prerelease": release.get("prerelease", False),
+                            }
+                        ))
+                    except (ValueError, KeyError, TypeError, AttributeError) as e:
+                        in_window = True  # unknown date: do not treat the page as exhausted
+                        self.record_failure("release", e, repo=repo_name, native_id=native_id)
+                        logger.warning("GitHub release skipped for %s (%s)", repo_name, type(e).__name__)
+                following = response.links.get("next", {}).get("url")
+                if not following or not in_window:
+                    break  # last page, or every release on this page predates the window
+                parts = urlsplit(following)
+                if parts.scheme != "https" or parts.netloc != "api.github.com" or not allowed_paths.match(parts.path):
+                    raise ValueError("Unexpected release pagination target")
+                if page == 5:
+                    self.coverage["truncated"] = True
+                    break
+                next_url = following
 
-            for release in releases:
-                published_at = datetime.fromisoformat(
-                    release["published_at"].replace("Z", "+00:00")
-                )
-
-                if published_at < since:
-                    continue
-
-                item = ContentItem(
-                    id=self._generate_id("github", "release", str(release["id"])),
-                    source_type=SourceType.GITHUB,
-                    title=f"{owner}/{repo} released {release['tag_name']}",
-                    url=release["html_url"],
-                    content=release.get("body", ""),
-                    author=release["author"]["login"],
-                    published_at=published_at,
-                    metadata={
-                        "repo": f"{owner}/{repo}",
-                        "tag": release["tag_name"],
-                        "prerelease": release.get("prerelease", False),
-                    }
-                )
-                items.append(item)
-
-        except httpx.HTTPError as e:
-            logger.warning("Error fetching releases for %s/%s: %s", owner, repo, e)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            self.record_failure("repo_releases", e, repo=repo_name)
+            logger.warning("GitHub releases failed for %s (%s)", repo_name, type(e).__name__)
 
         return items

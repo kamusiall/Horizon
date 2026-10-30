@@ -1,13 +1,14 @@
 """RSS feed scraper implementation."""
 
-import calendar
 import hashlib
 import logging
 import os
 import re
+import calendar
 from datetime import datetime, timezone
 from typing import List
 from email.utils import parsedate_to_datetime
+from dateutil.parser import isoparse
 import httpx
 import feedparser
 
@@ -20,14 +21,18 @@ logger = logging.getLogger(__name__)
 class RSSScraper(BaseScraper):
     """Scraper for RSS/Atom feeds."""
 
-    def __init__(self, sources: List[RSSSourceConfig], http_client: httpx.AsyncClient):
+    def __init__(self, sources: List[RSSSourceConfig], http_client: httpx.AsyncClient, keep_undated: bool = False):
         """Initialize RSS scraper.
 
         Args:
             sources: List of RSS feed configurations
             http_client: Shared async HTTP client
+            keep_undated: Research mode. Keep entries without a publication date and window
+                only on publication. The default keeps Horizon's windowing (fall back to
+                ``updated``; drop undated), because the digest has no cross-run dedup.
         """
         super().__init__({"sources": sources}, http_client)
+        self.keep_undated = keep_undated
 
     async def fetch(self, since: datetime) -> List[ContentItem]:
         """Fetch RSS feed items.
@@ -39,8 +44,14 @@ class RSSScraper(BaseScraper):
             List[ContentItem]: Fetched content items
         """
         items = []
+        self.reset_coverage()
+        self.coverage["instrumented"] = True
+        self.coverage["selection_limits"] = {"scope": "entries in the returned feed; unknown publication dates retained"} if self.keep_undated else {
+            "scope": "entries in the returned feed dated (published, else updated) within the window; undated entries dropped"}
         sources = self.config["sources"]
 
+        if not self.keep_undated:
+            self.coverage["selection_limits"]["dropped_undated"] = 0
         for source in sources:
             if not source.enabled:
                 continue
@@ -78,12 +89,25 @@ class RSSScraper(BaseScraper):
 
             # Parse feed
             feed = feedparser.parse(response.text)
+            if feed.bozo:
+                self.record_failure("parse_feed", feed.bozo_exception, source=source.name)
 
             for entry in feed.entries:
                 # Parse published date
                 published_at = self._parse_date(entry)
-                if not published_at or published_at < since:
-                    continue
+                updated_at = self._parse_date(entry, fields=("updated",))
+                if self.keep_undated:
+                    if published_at and published_at < since:
+                        continue
+                else:
+                    # Horizon's windowing: published, else updated; for zone-less dates fall back
+                    # to feedparser's *_parsed UTC reading (window only; published_at stays unknown).
+                    window_at = published_at or updated_at or self._legacy_utc(entry)
+                    if not window_at:
+                        self.coverage["selection_limits"]["dropped_undated"] += 1
+                        continue
+                    if window_at < since:
+                        continue
 
                 # Generate unique ID from feed URL and entry ID
                 feed_id = str(source.url).split("//")[1].replace("/", "_")
@@ -103,7 +127,11 @@ class RSSScraper(BaseScraper):
                     content=content,
                     author=entry.get("author", source.name),
                     published_at=published_at,
+                    updated_at=updated_at,
                     metadata={
+                        "original_url": entry.get("link", str(source.url)),
+                        "native_entry": dict(entry),
+                        "date_window": "within_window" if published_at else "unknown_publication" if self.keep_undated or updated_at else "legacy_utc_assumption",
                         "feed_name": source.name,
                         "category": source.category,
                         "tags": [tag.term for tag in entry.get("tags", [])],
@@ -112,13 +140,15 @@ class RSSScraper(BaseScraper):
                 items.append(item)
 
         except httpx.HTTPError as e:
-            logger.warning("Error fetching RSS feed %s: %s", source.name, e)
+            self.record_failure("fetch_feed", e, source=source.name)
+            logger.warning("RSS fetch failed for %s (%s)", source.name, type(e).__name__)
         except Exception as e:
-            logger.warning("Error parsing RSS feed %s: %s", source.name, e)
+            self.record_failure("parse_feed", e, source=source.name)
+            logger.warning("RSS parse failed for %s (%s)", source.name, type(e).__name__)
 
         return items
 
-    def _parse_date(self, entry: dict) -> datetime:
+    def _parse_date(self, entry: dict, fields=("published", "created")) -> datetime | None:
         """Parse publication date from feed entry.
 
         Args:
@@ -128,20 +158,33 @@ class RSSScraper(BaseScraper):
             datetime: Parsed publication date or None
         """
         # Try different date fields
-        for field in ["published", "updated", "created"]:
+        for field in fields:
             if field in entry:
                 try:
-                    # Try parsing structured time first
-                    if f"{field}_parsed" in entry and entry[f"{field}_parsed"]:
-                        return datetime.fromtimestamp(
-                            calendar.timegm(entry[f"{field}_parsed"]), tz=timezone.utc
-                        )
-                    # Fallback to string parsing
+                    # feedparser's structured time can assume UTC for a naive date.
+                    # Parse the original spelling and require an explicit timezone.
                     date_str = entry[field]
-                    return parsedate_to_datetime(date_str)
+                    try:
+                        parsed = parsedate_to_datetime(date_str)
+                        if parsed.tzinfo is None and date_str.rstrip().endswith("-0000"):
+                            # RFC 5322 "-0000": UTC with unknown local offset.
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        parsed = isoparse(date_str)
+                    if parsed.tzinfo is not None:
+                        return parsed.astimezone(timezone.utc)
                 except Exception:
                     continue
 
+        return None
+
+    @staticmethod
+    def _legacy_utc(entry: dict) -> datetime | None:
+        """315c8cc windowing: feedparser's structured time, which assumes UTC for zone-less dates."""
+        for field in ("published", "updated", "created"):
+            value = entry.get(f"{field}_parsed")
+            if value:
+                return datetime.fromtimestamp(calendar.timegm(value), tz=timezone.utc)
         return None
 
     def _extract_content(self, entry: dict) -> str:
