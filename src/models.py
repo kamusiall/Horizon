@@ -208,6 +208,9 @@ class TwitterConfig(BaseModel):
     # Playwright settings (used when mode == "playwright")
     cookie_dir: str = "data"
     cookie_file_pattern: str = "x_cookies_*.json"
+    # Single posts read with their reply thread (playwright mode only); not filtered by `since`
+    status_urls: List[str] = Field(default_factory=list)
+    status_max_replies: int = 20
 
 
 class OpenBBWatchlist(BaseModel):
